@@ -109,8 +109,11 @@ func (h *ForkableHub) GetBlockByHash(id string) (out *pbbstream.Block) {
 
 func (h *ForkableHub) HeadInfo() (headNum uint64, headID string, headTime time.Time, libNum uint64, err error) {
 	if h != nil && h.ready {
-		return h.forkable.HeadInfo()
+		headNum, headID, headTime, libNum, err = h.forkable.HeadInfo()
+		zlog.Debug("forkable hub head info", zap.Uint64("head_num", headNum), zap.String("head_id", headID), zap.Time("head_time", headTime), zap.Uint64("lib_num", libNum))
+		return
 	}
+	zlog.Debug("forkable hub not ready")
 	err = fmt.Errorf("not ready")
 	return
 }
@@ -230,14 +233,17 @@ func (h *ForkableHub) SourceThroughCursor(startBlock uint64, cursor *bstream.Cur
 }
 
 func (h *ForkableHub) bootstrap(blk *pbbstream.Block) error {
+	zlog.Info("bootstrapping ForkableHub", zap.Stringer("blk", blk.AsRef()))
 
 	// don't try bootstrapping from one-block-files if we are not at HEAD
 	if blk.Number < h.forkable.HeadNum() {
+		zlog.Info("skip bootstrapping ForkableHub from one-block-files", zap.Stringer("blk", blk.AsRef()), zap.Uint64("forkdb_head_num", h.forkable.HeadNum()))
 		return h.forkable.ProcessBlock(blk, nil)
 	}
 
 	if !h.forkable.Linkable(blk) {
 		startBlock := substractAndRoundDownBlocks(blk.LibNum, uint64(h.keepFinalBlocks))
+		zlog.Info("bootstrapping on un-linkable block", zap.Uint64("start_block", startBlock), zap.Stringer("head_block", blk.AsRef()))
 
 		var oneBlocksSource bstream.Source
 		if h.oneBlocksSourceFactoryWithSkipFunc != nil {
