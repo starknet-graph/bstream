@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package sf.bstream.forkable.v1.internal;
+
+import "google/protobuf/any.proto";
+import "sf/bstream/v1/bstream.proto";
+
+// Nobody can depends on this package, it's internal to the bstream package, the
+// "internal" package in Golang ensure only the bstream package can depend on it.
+option go_package = "github.com/streamingfast/bstream/forkable/pb/sf/bstream/forkable/v1/internal;pbforkable";
+
+message ForkDB {
+  // The mappings from block ID to parent's ID
+  map<string, string> links = 1;
+
+  // The mappings from block ID to block's number
+  map<string, uint64> nums = 2;
+
+  map<string, ForkNodeObject> objects = 3;
+
+  sf.bstream.v1.BlockRef lib_ref = 4;
+}
+
+message ForkNodeObject {
+  oneof object{
+    google.protobuf.Any protobuf = 1;
+    string json=2;
+    bytes binary=3;
+  }
+}

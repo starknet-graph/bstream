@@ -17,7 +17,9 @@ package forkable
 import (
 	"testing"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/streamingfast/bstream"
+	pbbstream "github.com/streamingfast/bstream/pb/sf/bstream/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -68,17 +70,16 @@ func TestForkDB_CompleteSegment_Loop(t *testing.T) {
 	f := NewForkDB()
 	f.InitLIB(bRef("00000002a"))
 
-	blkExists, parentExists := f.AddLink(bRef("00000001a"), "00000004a", nil)
+	blkExists, _ := f.AddLink(bRef("00000001a"), "00000004a", nil)
 	require.False(t, blkExists)
-	blkExists, parentExists = f.AddLink(bRef("00000002a"), "00000001a", nil)
+	blkExists, _ = f.AddLink(bRef("00000002a"), "00000001a", nil)
 	require.False(t, blkExists)
-	blkExists, parentExists = f.AddLink(bRef("00000003a"), "00000002a", nil)
+	blkExists, _ = f.AddLink(bRef("00000003a"), "00000002a", nil)
 	require.False(t, blkExists)
-	blkExists, parentExists = f.AddLink(bRef("00000004a"), "00000003a", nil)
+	blkExists, _ = f.AddLink(bRef("00000004a"), "00000003a", nil)
 	require.False(t, blkExists)
-	blkExists, parentExists = f.AddLink(bRef("00000005a"), "00000004a", nil)
+	blkExists, _ = f.AddLink(bRef("00000005a"), "00000004a", nil)
 	require.False(t, blkExists)
-	_ = parentExists
 
 	seg, reachedLIB := f.CompleteSegment(bRef("00000005a"))
 	require.Len(t, seg, 0)
@@ -298,8 +299,104 @@ func TestChainSwitchSegments(t *testing.T) {
 			undo, redo, _ := f.ChainSwitchSegments(test.headBlockID, test.newBlockPreviousID)
 			assert.Equal(t, test.expectedUndo, undo, "Undo segment")
 			assert.Equal(t, test.expectedRedo, redo, "Redo segment")
+
+			fSerialized := test.setupForkdb()
+
+			serialized, err := fSerialized.Serialize()
+			require.NoError(t, err)
+
+			fDeserialized := NewForkDB()
+			err = fDeserialized.Deserialize(serialized, nil)
+			require.NoError(t, err)
+
+			undo, redo, _ = fDeserialized.ChainSwitchSegments(test.headBlockID, test.newBlockPreviousID)
+			assert.Equal(t, test.expectedUndo, undo, "Undo segment")
+			assert.Equal(t, test.expectedRedo, redo, "Redo segment")
 		})
 	}
+}
+
+func TestSerializeDeserialize(t *testing.T) {
+
+	tests := []struct {
+		name          string
+		newObject     func(block bstream.BlockRef) any
+		objectFactory func() any
+	}{
+		{
+			name:          "nil",
+			newObject:     func(block bstream.BlockRef) any { return nil },
+			objectFactory: nil,
+		},
+		{
+			name:          "object json marshallable",
+			newObject:     func(block bstream.BlockRef) any { return &testJsonObjectMarshallable{ID: block.String()} },
+			objectFactory: func() any { return &testJsonObjectMarshallable{} },
+		},
+		{
+			name:          "json marsheller",
+			newObject:     func(block bstream.BlockRef) any { return &testJsonMarshaller{ID: block.String()} },
+			objectFactory: func() any { return &testJsonMarshaller{} },
+		},
+		{
+			name:          "proto message",
+			newObject:     func(block bstream.BlockRef) any { return &pbbstream.BlockRef{Id: block.ID(), Num: block.Num()} },
+			objectFactory: func() any { return &pbbstream.BlockRef{} },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			b1 := bTestBlock("00000001a", "00000000a").AsRef()
+			fdb := NewForkDB()
+			fdb.InitLIB(b1)
+
+			b2 := tb("00000002a", "00000001a", 1).AsRef()
+			b3 := tb("00000003a", "00000002a", 1).AsRef()
+
+			fdb.AddLink(b1, "", test.newObject(b1))
+			fdb.AddLink(b2, b1.ID(), test.newObject(b2))
+			fdb.AddLink(b3, b2.ID(), test.newObject(b3))
+
+			serialized, err := fdb.Serialize()
+			require.NoError(t, err)
+
+			fdb2 := NewForkDB()
+			err = fdb2.Deserialize(serialized, test.objectFactory)
+			require.NoError(t, err)
+
+			fdb2.MoveLIB(b2)
+			fdb2.PurgeBeforeLIB(0)
+			assert.Equal(t, b2.ID(), fdb2.LIBID())
+			assert.Equal(t, b2.Num(), fdb2.LIBNum())
+
+			assert.Equal(t, map[string]string{"00000003a": "00000002a", "00000002a": "00000001a"}, fdb2.links)
+
+			// Check object, b1 is gone so cannot be checked
+			if _, ok := test.newObject(b2).(proto.Message); ok {
+				// Use proto.Equal otherwise comparison fails
+				assert.True(t, proto.Equal(test.newObject(b2).(proto.Message), fdb.BlockForID(b2.ID()).Object.(proto.Message)))
+				assert.True(t, proto.Equal(test.newObject(b3).(proto.Message), fdb.BlockForID(b3.ID()).Object.(proto.Message)))
+			} else {
+				assert.Equal(t, test.newObject(b2), fdb.BlockForID(b2.ID()).Object)
+				assert.Equal(t, test.newObject(b3), fdb.BlockForID(b3.ID()).Object)
+			}
+		})
+	}
+}
+
+type testJsonObjectMarshallable struct {
+	ID string
+}
+
+func (v *testJsonObjectMarshallable) JSONMarshallable() {}
+
+type testJsonMarshaller struct {
+	ID string
+}
+
+func (v *testJsonMarshaller) MarshalJSON() ([]byte, error) {
+	return []byte(`{"id":"` + v.ID + `"}`), nil
 }
 
 func TestBlockForID(t *testing.T) {

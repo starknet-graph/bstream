@@ -15,11 +15,17 @@
 package forkable
 
 import (
+	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 
 	"github.com/streamingfast/bstream"
+	pbforkable "github.com/streamingfast/bstream/forkable/internal/pb/sf/bstream/forkable/v1"
+	pbbstream "github.com/streamingfast/bstream/pb/sf/bstream/v1"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 type ForkDBOption func(db *ForkDB)
@@ -533,6 +539,16 @@ func (f *ForkDB) BlockForID(blockID string) *Block {
 	return nil
 }
 
+// blockRefForID returns a BlockRef for a given block ID. Used only
+// if you already hold the f.linksLock!
+func (f *ForkDB) blockRefForID(blockID string) bstream.BlockRef {
+	if _, ok := f.links[blockID]; ok {
+		return bstream.NewBlockRef(blockID, f.nums[blockID])
+	}
+
+	return nil
+}
+
 func (f *ForkDB) IterateLinks(callback func(blockID, previousBlockID string, object interface{}) (getNext bool)) {
 	f.linksLock.Lock()
 	defer f.linksLock.Unlock()
@@ -542,4 +558,188 @@ func (f *ForkDB) IterateLinks(callback func(blockID, previousBlockID string, obj
 			break
 		}
 	}
+}
+
+func (f *ForkDB) Serialize() ([]byte, error) {
+	f.linksLock.Lock()
+	defer f.linksLock.Unlock()
+
+	msg := &pbforkable.ForkDB{}
+	msg.Links = f.links
+	msg.Nums = f.nums
+	msg.Objects = make(map[string]*pbforkable.ForkNodeObject, len(f.objects))
+	msg.LibRef = &pbbstream.BlockRef{
+		Id:  f.libRef.ID(),
+		Num: f.libRef.Num(),
+	}
+
+	var err error
+	for id, obj := range f.objects {
+		msg.Objects[id], err = f.serializeObject(obj)
+		if err != nil {
+			return nil, fmt.Errorf("serialize object for block %s: %w", f.blockRefForID(id), err)
+		}
+	}
+
+	return proto.Marshal(msg)
+}
+
+func (f *ForkDB) serializeObject(object any) (*pbforkable.ForkNodeObject, error) {
+	if object == nil {
+		return nil, nil
+	}
+
+	switch v := object.(type) {
+	case proto.Message:
+		out, err := anypb.New(v)
+		if err != nil {
+			return nil, fmt.Errorf("new anypb.Any: %w", err)
+		}
+
+		return &pbforkable.ForkNodeObject{Object: &pbforkable.ForkNodeObject_Protobuf{
+			Protobuf: out,
+		}}, nil
+
+	case ObjectJSONMarshallable, json.Marshaler:
+		data, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("marshal json: %w", err)
+		}
+
+		return &pbforkable.ForkNodeObject{Object: &pbforkable.ForkNodeObject_Json{
+			Json: string(data),
+		}}, nil
+
+	case ObjectBinaryMarshaler:
+		data, err := v.MarshalBinary()
+		if err != nil {
+			return nil, fmt.Errorf("marshal binary: %w", err)
+		}
+
+		return &pbforkable.ForkNodeObject{Object: &pbforkable.ForkNodeObject_Binary{
+			Binary: data,
+		}}, nil
+	}
+
+	return nil, fmt.Errorf(
+		"object of type %T is not serializable preventing ForkDB "+
+			"to be serialized, each object in the ForkDB.objects instance must be of type "+
+			"proto.Message, json.Marshaler, forkable.ObjectJSONMarshallable or "+
+			"forkable.ObjectBinaryMarshaler",
+		object,
+	)
+}
+
+// Deserialize the ForkDB from a series of bytes. The ForkDB holding objects of
+// unknown type, the `objectFactory` is used here so you can specify which type
+// of object is hold in the ForkDB `objects` map.
+//
+// The `objectFactory` is a function that returns a new empty pointer instance of
+// the object. It is used to deserialize the object from the serialized data be if
+// it's a JSON object or a binary object.
+//
+// If you are using protobuf objects, you can pass `nil` as the `objectFactory` as
+// Protobuf should be able to deserialize the correct message, don't forget to pull
+// the Golang dependencies of the Protobuf bindings your type(s) are correclty
+// registered.
+func (f *ForkDB) Deserialize(data []byte, objectFactory ObjectFactory) error {
+	msg := &pbforkable.ForkDB{}
+	if err := proto.Unmarshal(data, msg); err != nil {
+		return fmt.Errorf("unmarshal: %w", err)
+	}
+
+	// We don't need to lock here, as we are deserializing the whole state
+	// we must therefore be the only one accessing it.
+
+	f.links = msg.Links
+	f.nums = msg.Nums
+	f.objects = make(map[string]interface{}, len(msg.Objects))
+
+	var err error
+	for id, obj := range msg.Objects {
+		f.objects[id], err = f.deserializeObject(obj, objectFactory)
+		if err != nil {
+			return fmt.Errorf("deserialize object for block %s: %w", f.blockRefForID(id), err)
+		}
+	}
+
+	if msg.LibRef != nil {
+		f.libRef = bstream.NewBlockRef(msg.LibRef.Id, msg.LibRef.Num)
+	}
+
+	return nil
+}
+
+func (f *ForkDB) deserializeObject(obj *pbforkable.ForkNodeObject, objectFactory ObjectFactory) (any, error) {
+	// We must return nil if the object is nil so the map is populated correctly
+	if obj == nil {
+		return nil, nil
+	}
+
+	switch v := obj.Object.(type) {
+	case *pbforkable.ForkNodeObject_Protobuf:
+		obj, err := v.Protobuf.UnmarshalNew()
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal any: %w", err)
+		}
+
+		return obj, nil
+
+	case *pbforkable.ForkNodeObject_Json:
+		if objectFactory == nil {
+			return nil, fmt.Errorf("object factory is mandatory when deserializaing %T JSON object", obj.Object)
+		}
+
+		obj := objectFactory()
+		if err := json.Unmarshal([]byte(v.Json), &obj); err != nil {
+			return nil, fmt.Errorf("unmarshal json: %w", err)
+		}
+
+		return obj, nil
+
+	case *pbforkable.ForkNodeObject_Binary:
+		if objectFactory == nil {
+			return nil, fmt.Errorf("object factory is mandatory when deserializaing %T JSON object", obj.Object)
+		}
+
+		obj := objectFactory()
+		if unmarshaller, ok := obj.(ObjectBinaryMarshaler); !ok {
+			return nil, fmt.Errorf("object factory %T created object of type %T which "+
+				"do not implement 'forkable.ObjectBinaryMarshaler' interface, this is "+
+				"incorrect as we are trying to deserialize a binary object",
+				objectFactory, obj,
+			)
+		} else {
+			if err := unmarshaller.UnmarshalBinary([]byte(v.Binary)); err != nil {
+				return nil, fmt.Errorf("unmarshal binary: %w", err)
+			}
+		}
+
+		return obj, nil
+
+	default:
+		return nil, fmt.Errorf("serialized object of type %T is not handled properly", obj)
+	}
+}
+
+// ObjectFactory is an interface that tells the ForkDB how to create a new object
+// for deserialization. It is used when deserializing the ForkDB's object so that the
+// correct type is instantiated.
+type ObjectFactory func() any
+
+// ObjectBinaryMarshaler is an interface that tells the ForkDB that the object
+// can be serialized as binary via a call to `MarshalBinary` and deserialized
+// the same way via `UnmarshalBinary` assuming you correctly provide the `objectFactory`
+// when calling `ForkDB#Deserialize`.
+type ObjectBinaryMarshaler interface {
+	MarshalBinary() ([]byte, error)
+	UnmarshalBinary([]byte) error
+}
+
+// ObjectJSONMarshallable is a marker interface that tells the ForkDB that the object
+// can be serialized as JSON via a call to `json.Marshal` and deserialized
+// the same way via `json.Unmarshal` assuming you correctly provide the `objectFactory`
+// when calling `ForkDB#Deserialize`.
+type ObjectJSONMarshallable interface {
+	JSONMarshallable()
 }
