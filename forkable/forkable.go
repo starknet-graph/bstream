@@ -992,19 +992,19 @@ func ShouldReplaceStarknePendingtBlock(oldBlock *pbbstream.Block, newBlock *pbbs
 
 	// Pending blocks do not have block hashes. We use a pseudo block hash format:
 	//
-	// +-------+-----------+--------------+---------------------+------------------+
-	// | Fixed | "PENDING" | Block Number | Transaction Count   | Reserved         |
-	// | 1 byte| 7 bytes   | 8 bytes      | 4 bytes             | 12 bytes         |
-	// +-------+-----------+--------------+---------------------+------------------+
-	// |  00   |    50     |      NN      |         NN          |        00        |
-	// |       |    45     |      NN      |         NN          |        00        |
-	// |       |    4E     |      NN      |         NN          |        00        |
-	// |       |    44     |      NN      |         NN          |        00        |
-	// |       |    49     |      NN      |                     |        00        |
-	// |       |    4E     |      NN      |                     |        00        |
-	// |       |    47     |      NN      |                     |        00        |
-	// |       |           |      NN      |                     |        00        |
-	// +-------+-----------+--------------+---------------------+------------------+
+	// +--------+-----------+--------------+-------------------+----------+----------+
+	// | Fixed  | "PENDING" | Block Number | Transaction Count | Reserved | Checksum |
+	// | 1 byte | 7 bytes   | 8 bytes      | 4 bytes           | 8 bytes  | 4 bytes  |
+	// +--------+-----------+--------------+-------------------+----------+----------+
+	// |  00    |    50     |      NN      |         NN        |    00    |   NN     |
+	// |        |    45     |      NN      |         NN        |    00    |   NN     |
+	// |        |    4E     |      NN      |         NN        |    00    |   NN     |
+	// |        |    44     |      NN      |         NN        |    00    |   NN     |
+	// |        |    49     |      NN      |                   |    00    |          |
+	// |        |    4E     |      NN      |                   |    00    |          |
+	// |        |    47     |      NN      |                   |    00    |          |
+	// |        |           |      NN      |                   |    00    |          |
+	// +--------+-----------+--------------+-------------------+----------+----------+
 
 	// Block ID decoding
 	oldBlockId, err := hex.DecodeString(strings.TrimPrefix(oldBlock.Id, "0x"))
