@@ -15,8 +15,11 @@
 package forkable
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -966,7 +969,76 @@ func (p *Forkable) triggersNewLongestChain(blk *pbbstream.Block) bool {
 		return true
 	}
 
+	// This is a Starknet-specific patch. There's a so-called "pending" block in Starknet which keeps
+	// growing until it confirms. Firehose does not natively support such a concept, so we emulate it
+	// with a pseudo block. This block should replace the previous "pending" block iif it contains a
+	// longer list of transactions.
+	//
+	// An alternative would be to fork `firehose-core` and set `ensureAllBlocksTriggerLongestChain` on
+	// the `firehose` app. However, doing that would unconditionally stream any newly discovered
+	// pending blocks to clients, which could actually contain fewer transactions when multiple sources
+	// are used.
+	if ShouldReplaceStarknePendingtBlock(p.lastBlockSent, blk) {
+		return true
+	}
+
 	return false
+}
+
+func ShouldReplaceStarknePendingtBlock(oldBlock *pbbstream.Block, newBlock *pbbstream.Block) bool {
+	if newBlock.Number != oldBlock.Number || newBlock.ParentId != oldBlock.ParentId {
+		return false
+	}
+
+	// Pending blocks do not have block hashes. We use a pseudo block hash format:
+	//
+	// +-------+-----------+--------------+---------------------+------------------+
+	// | Fixed | "PENDING" | Block Number | Transaction Count   | Reserved         |
+	// | 1 byte| 7 bytes   | 8 bytes      | 4 bytes             | 12 bytes         |
+	// +-------+-----------+--------------+---------------------+------------------+
+	// |  00   |    50     |      NN      |         NN          |        00        |
+	// |       |    45     |      NN      |         NN          |        00        |
+	// |       |    4E     |      NN      |         NN          |        00        |
+	// |       |    44     |      NN      |         NN          |        00        |
+	// |       |    49     |      NN      |                     |        00        |
+	// |       |    4E     |      NN      |                     |        00        |
+	// |       |    47     |      NN      |                     |        00        |
+	// |       |           |      NN      |                     |        00        |
+	// +-------+-----------+--------------+---------------------+------------------+
+
+	// Block ID decoding
+	oldBlockId, err := hex.DecodeString(strings.TrimPrefix(oldBlock.Id, "0x"))
+	if err != nil || len(oldBlockId) != 32 {
+		return false
+	}
+	newBlockId, err := hex.DecodeString(strings.TrimPrefix(newBlock.Id, "0x"))
+	if err != nil || len(newBlockId) != 32 {
+		return false
+	}
+
+	// This checks whether `lastBlockSent` is a confirmed block, as we never want to trigger a chain
+	// switch replacing a confirmed block with a pending block. This should be extremely rare though.
+	// It should only happen when there's a bug in the sequencer, as normally confirmed blocks come
+	// from the last pending block, so it shouldn't be lighter than any of the observed pending block
+	// for that height.
+	isOldBlockPending := string(oldBlockId[1:1+7]) == "PENDING"
+	isNewBlockPending := string(newBlockId[1:1+7]) == "PENDING"
+
+	// Never replace a confirmed block
+	if !isOldBlockPending {
+		return false
+	}
+
+	// Always replace a pending block with a confirmed block
+	if !isNewBlockPending {
+		return true
+	}
+
+	// Both blocks are pending. Now compare the tx count
+	oldBlockTxCount := binary.BigEndian.Uint32(oldBlockId[1+7+8 : 1+7+8+4])
+	newBlockTxCount := binary.BigEndian.Uint32(newBlockId[1+7+8 : 1+7+8+4])
+
+	return newBlockTxCount > oldBlockTxCount
 }
 
 func (p *Forkable) HeadInfo() (headNum uint64, headID string, headTime time.Time, libNum uint64, err error) {
